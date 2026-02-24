@@ -1,0 +1,131 @@
+name: Build KernelSU Kernel for SM-M127F
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_version:
+        description: 'KernelSU version (leave empty for latest)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          git bc bison flex libssl-dev make libc6-dev libncurses5-dev \
+          crossbuild-essential-arm64 python3 python2 zip unzip \
+          libelf-dev gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+          clang lld llvm
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 \
+          https://github.com/samsungexynos850/android_kernel_samsung_exynos850 \
+          kernel
+        echo "Kernel source cloned"
+        ls kernel/
+
+    - name: Apply KernelSU patch
+      run: |
+        cd kernel
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+        echo "KernelSU patch applied"
+        cat KernelSU/version
+
+    - name: Setup defconfig for M127F
+      run: |
+        cd kernel
+        # Ищем конфиг для M127F / universal3830
+        find . -name "*m127*" -o -name "*M127*" | head -10
+        find arch/arm64/configs/ | grep -i "m127\|a12\|universal3830" | head -10
+
+    - name: Configure kernel
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+        
+        # Найдём правильный defconfig
+        DEFCONFIG=$(find arch/arm64/configs/ -name "*m127*" -o -name "*a12s*" -o -name "*universal3830*" | head -1)
+        if [ -z "$DEFCONFIG" ]; then
+          DEFCONFIG="arch/arm64/configs/exynos850_defconfig"
+        fi
+        DEFCONFIG=$(basename $DEFCONFIG)
+        echo "Using defconfig: $DEFCONFIG"
+        
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- $DEFCONFIG
+        
+        # Включаем KernelSU
+        echo "CONFIG_KSU=y" >> .config
+        echo "CONFIG_OVERLAY_FS=y" >> .config
+        
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+    - name: Build kernel
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        make ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          -j$(nproc) \
+          2>&1 | tail -50
+        
+        ls -lh arch/arm64/boot/Image
+
+    - name: Package with AnyKernel3
+      run: |
+        # Клонируем AnyKernel3
+        git clone --depth=1 \
+          https://github.com/osm0sis/AnyKernel3 \
+          anykernel
+        
+        # Копируем Image
+        cp kernel/arch/arm64/boot/Image anykernel/
+        
+        # Настраиваем anykernel.sh для M127F
+        cat > anykernel/anykernel.sh << 'AKEOF'
+        # AnyKernel3 config
+        kernel.string=physwizz KernelSU Kernel for SM-M127F
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=m12
+        device.name2=m12nacho
+        device.name3=SM-M127F
+        supported.versions=11
+        
+        # AnyKernel methods
+        . tools/ak3-core.sh
+        
+        dump_boot;
+        patch_cmdline "androidboot.selinux" "androidboot.selinux=permissive";
+        patch_cmdline "selinux" "selinux=0";
+        patch_cmdline "enforcing" "enforcing=0";
+        write_boot;
+        AKEOF
+        
+        # Пакуем zip
+        cd anykernel
+        zip -r9 \
+          ../physwizz_m127f_kernelsu.zip \
+          . \
+          -x "*.git*" "*.github*"
+        
+        ls -lh ../physwizz_m127f_kernelsu.zip
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: physwizz_m127f_kernelsu
+        path: physwizz_m127f_kernelsu.zip
+        retention-days: 7
